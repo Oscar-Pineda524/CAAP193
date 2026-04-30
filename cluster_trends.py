@@ -20,6 +20,7 @@ DEFAULT_RAW_DIR = Path("RAW_Parquet-selected")
 
 GROUP_LABELS = {"T": "Treatment", "C": "Control"}
 GROUP_BASE_COLORS = {"Treatment": "#e67e22", "Control": "#2e86c1"}
+RATIO_EPSILON = 1e-9
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +102,18 @@ def build_subject_lookup(surgery_df: pd.DataFrame) -> pd.DataFrame:
 
 def metric_output_stem(metric_name: str) -> str:
     return metric_name.replace("_per_day", "")
+
+
+def metric_display_labels(metric_name: str) -> tuple[str, str]:
+    if metric_name == "clusters_per_day":
+        return "Clusters Per Day", "Number of Clusters Per Day"
+    if metric_name == "mean_cluster_count_per_day":
+        return "Mean Cluster Count Per Day", "Mean Cluster Count Per Day"
+    if metric_name == "clusters_per_day_day_night_ratio":
+        return "Day/Night Ratio: Clusters Per Day", "Day/Night Ratio"
+    if metric_name == "mean_cluster_count_per_day_day_night_ratio":
+        return "Day/Night Ratio: Mean Cluster Count Per Day", "Day/Night Ratio"
+    return metric_name, metric_name
 
 
 def period_output_stem(period_label: str) -> str:
@@ -188,6 +201,81 @@ def summarize_daily_metric(cluster_rows_df: pd.DataFrame, metric_name: str) -> p
     return daily_df
 
 
+def summarize_daily_metric_by_period(cluster_rows_df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    if metric_name == "clusters_per_day":
+        daily_df = (
+            cluster_rows_df.groupby(
+                ["subject_initial", "cluster_date", "day_or_night"],
+                as_index=False,
+            )
+            .size()
+            .rename(columns={"size": metric_name})
+        )
+    elif metric_name == "mean_cluster_count_per_day":
+        daily_df = (
+            cluster_rows_df.groupby(
+                ["subject_initial", "cluster_date", "day_or_night"],
+                as_index=False,
+            )["count"]
+            .mean()
+            .rename(columns={"count": metric_name})
+        )
+    else:
+        raise ValueError(f"Unsupported metric: {metric_name}")
+
+    return daily_df
+
+
+def summarize_day_night_ratio(cluster_rows_df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    period_daily_df = summarize_daily_metric_by_period(cluster_rows_df, metric_name)
+    period_daily_df = period_daily_df[
+        period_daily_df["day_or_night"].isin(["day", "night"])
+    ].copy()
+    if period_daily_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "subject_initial",
+                "cluster_date",
+                "day_value",
+                "night_value",
+                f"{metric_name}_day_night_ratio",
+                f"{metric_name}_log2_day_night_ratio",
+            ]
+        )
+
+    wide = period_daily_df.pivot_table(
+        index=["subject_initial", "cluster_date"],
+        columns="day_or_night",
+        values=metric_name,
+        aggfunc="first",
+    ).reset_index()
+
+    for column in ["day", "night"]:
+        if column not in wide.columns:
+            wide[column] = np.nan
+
+    ratio_metric_name = f"{metric_name}_day_night_ratio"
+    log_ratio_metric_name = f"{metric_name}_log2_day_night_ratio"
+    valid = wide["day"].notna() & wide["night"].notna() & (wide["night"] > 0)
+    wide[ratio_metric_name] = np.nan
+    wide.loc[valid, ratio_metric_name] = wide.loc[valid, "day"] / wide.loc[valid, "night"]
+    wide[log_ratio_metric_name] = np.nan
+    wide.loc[valid, log_ratio_metric_name] = np.log2(
+        wide.loc[valid, ratio_metric_name].clip(lower=RATIO_EPSILON)
+    )
+    wide = wide.rename(columns={"day": "day_value", "night": "night_value"})
+    return wide[
+        [
+            "subject_initial",
+            "cluster_date",
+            "day_value",
+            "night_value",
+            ratio_metric_name,
+            log_ratio_metric_name,
+        ]
+    ].dropna(subset=[ratio_metric_name, log_ratio_metric_name])
+
+
 def filter_cluster_rows_for_period(cluster_rows_df: pd.DataFrame, period_label: str) -> pd.DataFrame:
     if period_label == "all":
         return cluster_rows_df.copy()
@@ -257,6 +345,12 @@ def save_daily_counts_for_period(
     output_path = output_dir / (
         f"daily_{metric_output_stem(metric_name)}_{period_output_stem(period_label)}.csv"
     )
+    data.to_csv(output_path, index=False)
+    return output_path
+
+
+def save_day_night_ratio(data: pd.DataFrame, output_dir: Path, metric_name: str) -> Path:
+    output_path = output_dir / f"daily_{metric_output_stem(metric_name)}_day_night_ratio.csv"
     data.to_csv(output_path, index=False)
     return output_path
 
@@ -392,6 +486,95 @@ def plot_group_trends(
     return output_path
 
 
+def plot_day_night_ratio_trends(
+    data: pd.DataFrame,
+    combined_result,
+    subject_colors: dict[str, str],
+    output_dir: Path,
+    point_alpha: float,
+    metric_name: str,
+) -> Path:
+    ratio_metric_name = f"{metric_name}_day_night_ratio"
+    log_ratio_metric_name = f"{metric_name}_log2_day_night_ratio"
+    title_metric, _ = metric_display_labels(f"{metric_name}_day_night_ratio")
+    fig, ax = plt.subplots(figsize=(13, 7.5))
+    params = combined_result.params
+
+    for group_label in ["Treatment", "Control"]:
+        group_df = data.loc[data["group_label"] == group_label].copy()
+        if group_df.empty:
+            continue
+
+        for subject in sorted(group_df["subject"].unique()):
+            subject_df = group_df.loc[group_df["subject"] == subject].sort_values("days_since_surgery")
+            subject_color = subject_colors[subject]
+            ax.plot(
+                subject_df["days_since_surgery"],
+                subject_df[log_ratio_metric_name],
+                color=subject_color,
+                linewidth=1.0,
+                alpha=0.35,
+            )
+            ax.scatter(
+                subject_df["days_since_surgery"],
+                subject_df[log_ratio_metric_name],
+                s=42,
+                alpha=point_alpha,
+                color=subject_color,
+                edgecolors="none",
+            )
+
+        slope = float(params.get("days_since_surgery", 0.0))
+        if group_label == "Treatment":
+            slope += float(params.get("days_since_surgery:group_label[T.Treatment]", 0.0))
+
+        x_grid = np.linspace(group_df["days_since_surgery"].min(), group_df["days_since_surgery"].max(), 200)
+        x_center = float(group_df["days_since_surgery"].mean())
+        y_center = float(group_df[log_ratio_metric_name].mean())
+        y_line = y_center + slope * (x_grid - x_center)
+        ax.plot(
+            x_grid,
+            y_line,
+            color=GROUP_BASE_COLORS[group_label],
+            linewidth=3.25,
+            label=f"{group_label} mean slope",
+        )
+
+    ratio_ticks = np.array([0.25, 0.5, 1, 2, 4], dtype=float)
+    ax.set_yticks(np.log2(ratio_ticks))
+    ax.set_yticklabels(["0.25", "0.5", "1", "2", "4"])
+    ax.axhline(0, color="#333333", linewidth=1.2, linestyle="--", alpha=0.75)
+
+    treatment_proxy = plt.Line2D([0], [0], marker="o", linestyle="", color=GROUP_BASE_COLORS["Treatment"])
+    control_proxy = plt.Line2D([0], [0], marker="o", linestyle="", color=GROUP_BASE_COLORS["Control"])
+    treatment_line = plt.Line2D([0], [0], color=GROUP_BASE_COLORS["Treatment"], linewidth=3)
+    control_line = plt.Line2D([0], [0], color=GROUP_BASE_COLORS["Control"], linewidth=3)
+    balanced_line = plt.Line2D([0], [0], color="#333333", linewidth=1.2, linestyle="--")
+    ax.legend(
+        [treatment_proxy, control_proxy, treatment_line, control_line, balanced_line],
+        [
+            "Treatment subject-days",
+            "Control subject-days",
+            "Treatment mean slope",
+            "Control mean slope",
+            "Day = Night",
+        ],
+        loc="best",
+        frameon=True,
+    )
+
+    ax.set_title(f"{title_metric} Relative to Surgery")
+    ax.set_xlabel("Days Since Surgery")
+    ax.set_ylabel("Day/Night Ratio")
+    ax.grid(alpha=0.25, linewidth=0.8)
+    fig.tight_layout()
+
+    output_path = output_dir / f"group_{metric_output_stem(metric_name)}_day_night_ratio_trends.png"
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+
 def plot_subject_trends(
     data: pd.DataFrame,
     subject_colors: dict[str, str],
@@ -472,6 +655,9 @@ def write_analysis_notes(output_dir: Path) -> Path:
           clusters_per_day and mean_cluster_count_per_day.
         - Each outcome is generated three ways:
           all clusters, day-only clusters, and night-only clusters.
+        - The script also computes a paired day/night ratio for each outcome using subject-days
+          with both day and night values. Ratio plots are shown on a log2-scaled axis so
+          day-dominant and night-dominant changes are visually symmetric.
         - Each combined mixed model uses a random intercept for subject:
           outcome ~ days_since_surgery * group_label
         - Subject-level trend plots use a simple linear fit per subject for visualization.
@@ -564,6 +750,51 @@ def main() -> None:
                     f"Saved {metric_name} ({period_label}) per-subject trend plots to: {subject_plot_dir}",
                 ]
             )
+
+        ratio_daily_df = summarize_day_night_ratio(cluster_rows_df, metric_name)
+        if ratio_daily_df.empty:
+            output_records.append(
+                f"Skipped {metric_name} day/night ratio: no paired day and night values were available."
+            )
+            continue
+
+        ratio_metric_name = f"{metric_name}_day_night_ratio"
+        log_ratio_metric_name = f"{metric_name}_log2_day_night_ratio"
+        ratio_analysis_df = prepare_analysis_dataframe(ratio_daily_df, surgery_lookup, ratio_metric_name)
+        if ratio_analysis_df.empty or ratio_analysis_df["subject"].nunique() < 2:
+            output_records.append(
+                f"Skipped {metric_name} day/night ratio: not enough subject-day data for modeling."
+            )
+            continue
+
+        ratio_subject_colors = build_subject_color_map(ratio_analysis_df)
+        ratio_result = fit_mixed_model(
+            ratio_analysis_df,
+            f"{log_ratio_metric_name} ~ days_since_surgery * group_label",
+        )
+        ratio_csv_path = save_day_night_ratio(ratio_analysis_df, args.output_dir, metric_name)
+        ratio_summary_path = save_model_summaries(
+            ratio_result,
+            ratio_analysis_df,
+            args.output_dir,
+            log_ratio_metric_name,
+            "day_night_ratio",
+        )
+        ratio_plot_path = plot_day_night_ratio_trends(
+            ratio_analysis_df,
+            ratio_result,
+            ratio_subject_colors,
+            args.output_dir,
+            args.point_alpha,
+            metric_name,
+        )
+        output_records.extend(
+            [
+                f"Saved {metric_name} day/night ratio daily values to: {ratio_csv_path}",
+                f"Saved {metric_name} day/night ratio mixed model summaries to: {ratio_summary_path}",
+                f"Saved {metric_name} day/night ratio trend plot to: {ratio_plot_path}",
+            ]
+        )
     for line in output_records:
         print(line)
     print(f"Saved notes to: {notes_path}")
